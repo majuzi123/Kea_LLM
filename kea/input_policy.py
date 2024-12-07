@@ -59,6 +59,7 @@ POLICY_GUIDED = "guided"
 POLICY_RANDOM = "random"
 POLICY_NONE = "none"
 POLICY_LLM = "llm"
+POLICY_LLM_Guided = "llm_guided"
 
 @dataclass
 class RULE_STATE:
@@ -1080,3 +1081,544 @@ class LLMPolicy(RandomPolicy):
 
     def clear_action_history(self):
         self.__action_history = []
+
+
+class LLMGuidedPolicy(KeaInputPolicy):
+    """
+
+    """
+
+    def __init__(self, device, app, random_input, kea=None, generate_utg=False):
+        super(LLMGuidedPolicy, self).__init__(
+            device, app, random_input, kea
+        )
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        # if len(self.kea.all_mainPaths):
+        #     self.logger.info("Found %d mainPaths" % len(self.kea.all_mainPaths))
+        # else:
+        #     self.logger.error("No mainPath found")
+
+        self.__num_restarts = 0
+        self.__num_steps_outside = 0
+        self.__event_trace = ""
+        self.__missed_states = set()
+
+        self.execute_main_path = True
+
+        self.current_index_on_main_path = 0
+        self.max_number_of_mutate_steps_on_single_node = 20
+        self.current_number_of_mutate_steps_on_single_node = 0
+        self.number_of_events_that_try_to_find_event_on_main_path = 0
+        self.index_on_main_path_after_mutation = -1
+
+        self.last_random_text = None
+        self.last_rotate_events = KEY_RotateDeviceNeutralEvent
+
+        self.generate_utg = generate_utg
+
+        self.__action_history = []
+        self.__all_action_history = set()
+        self.__activity_history = set()
+        self.from_state = None
+        self.rule_info_list = self.extract_rules_info()
+
+    def extract_rules_info(self):
+        rule_info_list = []
+
+        for rule in self.kea.all_rules:
+            # 提取函数名称
+            function_name = rule.function.__name__
+
+            # for precondition in rule.preconditions:
+            if callable(rule.preconditions[0]):
+                try:
+                    resource_ids_in_precondition = self.extract_resource_ids(rule.preconditions[0])
+                     # resource_ids.extend(resource_ids_in_precondition)
+                except Exception as e:
+                    print(f"Error extracting resourceId: {e}")
+                    # resource_ids.append(None)
+            else:
+                resource_ids_in_precondition = ''
+            rule_info_list.append({
+                'function_name': function_name,
+                'resource_ids': resource_ids_in_precondition,
+                'met': False,
+                'exploration_count': 0
+            })
+
+        return rule_info_list
+
+    def extract_resource_ids(self, precondition):
+        import inspect
+        resource_ids = []
+        src = inspect.getsource(precondition)
+        pattern = r'@precondition\((.*?)\)'
+        resource_id_pattern = r'resourceId="([^"]+)"'
+
+        match = re.search(pattern, src, re.DOTALL)
+        if match:
+            inside_precondition = match.group(1)
+            resource_ids = re.findall(resource_id_pattern, inside_precondition)
+        return resource_ids[0]
+
+    # def select_main_path(self):
+    #     if len(self.kea.all_mainPaths) == 0:
+    #         self.logger.error("No mainPath")
+    #         return
+    #     self.main_path = random.choice(self.kea.all_mainPaths)
+    #     self.path_func, self.main_path = self.kea.parse_mainPath(self.main_path)
+    #     self.logger.info(f"Select the {len(self.main_path)} steps mainPath function: {self.path_func}")
+    #     self.main_path_list = copy.deepcopy(self.main_path)
+    #     self.max_number_of_events_that_try_to_find_event_on_main_path = min(10, len(self.main_path))
+    #     self.mutate_node_index_on_main_path = len(self.main_path)
+
+    # def set_target(self, target_resource_id, target_function_name):
+    #     self.target_resource_id = target_resource_id
+    #     self.target_function_name = target_function_name
+
+    def generate_event(self):
+        """
+
+        """
+
+        current_state = self.device.get_current_state()
+
+        # Return relevant events based on whether the application is in the foreground.
+
+        event = self.check_the_app_on_foreground(current_state)
+        if event is not None:
+            return event
+
+
+        if self.all_preconditions_met_or_explored(100):
+            # 所有前置条件都满足后，进行随机探索
+            event = self.mutate_the_main_path()
+        else:
+            # 从rule_info_list中选择一个规则
+            rule_info = self.get_next_rule_info()
+            if rule_info:
+                function_name = rule_info['function_name']
+                resource_ids = rule_info['resource_ids']
+
+                # 使用LLM来找到到达目标状态的路径
+                action, candidate_actions = self.query_llm_for_navigation(current_state, function_name, resource_ids)
+                if action is not None:
+                    self.logger.info(f"LLM suggested event: {action}")
+                    self.__action_history.append(current_state.get_action_desc(action))
+                    self.__all_action_history.add(current_state.get_action_desc(action))
+                    return action
+                # 如果LLM没有返回有效的事件，执行下一个前置条件规则
+                event = self.execute_next_precondition_rule(current_state, rule_info)
+            else:
+                self.logger.info("No more rules to process.")
+                # 可以选择进行随机探索或结束测试
+
+        return event
+
+    def get_next_rule_info(self):
+        # 从rule_info_list中选择一个未满足的规则
+        for rule_info in self.rule_info_list:
+            if not rule_info['met'] and rule_info['exploration_count'] < 100:
+                    return rule_info
+        return None
+        # # 如果LLM没有返回有效的事件，可能需要执行默认操作或生成一个探索事件
+        # self.logger.info("LLM did not provide a valid event, performing default action.")
+        #
+        # if (self.action_count == ACTION_COUNT_TO_START and self.current_index_on_main_path == 0) or isinstance(
+        #         self.last_event, ReInstallAppEvent):
+        #     self.select_main_path()
+        #     self.run_initial_rules()
+        #     time.sleep(2)
+        # if self.execute_main_path:
+        #     event_str = self.get_main_path_event()
+        #     if event_str:
+        #         self.logger.info("*****main path running*****")
+        #         self.kea.exec_mainPath(event_str)
+        #         return None
+        # if event is None:
+        #     event = self.mutate_the_main_path()
+        #
+        # return event
+
+    def execute_next_precondition_rule(self, current_state):
+        # 寻找并执行下一个前置条件对应的规则
+        for rule_info in self.rule_info_list:
+            if not rule_info['met'] and rule_info['exploration_count'] < 100:
+                # 导航至对应的页面并执行规则
+                if self.is_current_state_for_rule(current_state, rule_info['resource_ids']):
+                    event = self.execute_rule(rule_info['function_name'])
+                    if event:
+                        rule_info['exploration_count'] += 1
+                        return event
+        return None  # 如果没有找到对应的规则或页面，返回None
+
+    def is_current_state_for_rule(self, current_state, resource_ids):
+        # 检查当前状态是否为规则对应的页面
+        for resource_id in resource_ids:
+            if resource_id in current_state:  # 假设current_state包含resource_id
+                return True
+        return False
+
+    def all_preconditions_met_or_explored(self, max_exploration_count):
+        # 检查所有前置条件是否都已满足或达到探索次数上限
+        for rule_info in self.rule_info_list:
+            if not rule_info['met'] and rule_info['exploration_count'] < max_exploration_count:
+                return False
+        return True
+
+    def update_exploration_counts(self, current_precondition_index):
+        # 更新特定前置条件的探索次数
+        if current_precondition_index < len(self.rule_info_list):
+            rule_info = self.rule_info_list[current_precondition_index]
+            if not rule_info['met']:
+                rule_info['exploration_count'] += 1
+
+    def query_llm_for_navigation(self, current_state,function_name, resource_id):
+        # Use LLM to determine the next action to take in order to reach the target state
+        task_prompt = (
+            "You are an expert in App GUI testing. "
+            "Your task is to guide the testing tool to reach the page with resourceId '{}' "
+            "where the function '{}' needs to be tested. "
+            "Based on the current GUI information, please suggest the next action to take."
+        ).format(resource_id, function_name)
+
+        visited_page_prompt = f'I have already visited the following activities: \n' + '\n'.join(
+            self.__activity_history)
+        history_prompt = f'I have already completed the following steps to navigate: \n ' + ';\n '.join(
+            self.__action_history)
+        state_prompt, candidate_actions = current_state.get_described_actions()
+        question = 'Which action should I choose next? Just return the action id and nothing else.\nIf no more action is needed, return -1.'
+
+        # 将所有部分组合成完整的提示词
+        full_prompt = f'{task_prompt}\n{visited_page_prompt}\n{history_prompt}\n{state_prompt}\n{question}'
+        print(full_prompt)
+        response = self._query_llm(full_prompt)
+        print('response: ', response)
+        match = re.search(r'\d+', response)
+        if not match:
+            return None, candidate_actions
+        idx = int(match.group(0))
+        selected_action = candidate_actions[idx]
+        if isinstance(selected_action, SetTextEvent):
+            view_text = current_state.get_view_desc(selected_action.view)
+            question = f'What text should I enter to the {view_text}? Just return the text and nothing else.'
+            prompt = f'{task_prompt}\n{state_prompt}\n{question}'
+            print(prompt)
+            response = self._query_llm(prompt)
+            print(f'response: {response}')
+            selected_action.text = response.replace('"', '')
+            if len(selected_action.text) > 30:  # heuristically disable long text input
+                selected_action.text = ''
+        return selected_action, candidate_actions
+        # action_id = self.parse_action_id(response)
+        # if action_id == -1:
+        #     return None  # No more actions needed
+        # return self.get_action_by_id(current_state, action_id)
+
+    def _query_llm(self, prompt):
+        # TODO: replace with your own LLM
+        from openai import OpenAI
+        client = OpenAI(
+            api_key="sk-wAdbDvY3957qtwtGv0gas9yv6yCTLo8jMBkhyIg4bVIlPjxt",
+            base_url="https://api.moonshot.cn/v1",
+        )
+        response = self.send_request_with_retry(
+            client,
+            "moonshot-v1-8k",
+            [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            0.3,
+        )
+        return response
+
+    def send_request_with_retry(self, client, model, messages, temperature, max_retries=3, delay=60):
+        retries = 0
+        while retries < max_retries:
+            try:
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                )
+                return completion.choices[0].message.content
+            except Exception as e:
+                retries += 1
+                if retries < max_retries:
+                    print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    print("Max retries reached. Aborting...")
+                    raise
+
+    # def _query_llm(self, prompt, model_name="moonshot-v1-8k"):
+    #     # TODO: replace with your own LLM
+    #     from openai import OpenAI
+    #     client = OpenAI(
+    #         api_key="",
+    #         base_url="https://api.moonshot.cn/v1",
+    #     )
+    #     messages = [{"role": "user", "content": prompt}]
+    #     completion = client.chat.completions.create(messages=messages, model=model_name, temperature=0.3)
+    #     return completion.choices[0].message.content
+
+    def parse_action_id(self, response):
+        match = re.search(r'\d+', response)
+        return int(match.group(0)) if match else None
+
+    # def get_action_by_id(self, current_state, action_id):
+    #     candidate_actions = current_state.get_candidate_actions()
+    #     return candidate_actions[action_id] if 0 <= action_id < len(candidate_actions) else None
+
+    def end_mutation(self):
+        self.index_on_main_path_after_mutation = -1
+        self.number_of_events_that_try_to_find_event_on_main_path = 0
+        self.execute_main_path = True
+        self.current_number_of_mutate_steps_on_single_node = 0
+        self.current_index_on_main_path = 0
+        self.mutate_node_index_on_main_path -= 1
+        if self.mutate_node_index_on_main_path == -1:
+            self.mutate_node_index_on_main_path = len(self.main_path)
+            return ReInstallAppEvent(app=self.app)
+        self.logger.info("reach the max number of mutate steps on single node, restart the app")
+        return KillAndRestartAppEvent(app=self.app)
+
+    def check_property_with_probability(self, p=0.5):
+        """
+        try to check property with probability (default 50%)
+        return 1 if the property has been checked.
+        """
+        rules_list_to_check = self.kea.get_rules_that_pass_the_preconditions()
+
+        if len(rules_list_to_check) > 0:
+            t = self.time_recoder.get_time_duration()
+            self.time_needed_to_satisfy_precondition.append(t)
+            self.logger.info(
+                f"Found {len(rules_list_to_check)} rules satisfied the precondition. Current execution time {self.time_recoder.get_time_duration()}")
+            if random.random() < p:
+                self.time_to_check_rule.append(t)
+                self.logger.info(" check rule")
+                self.check_rule_with_precondition()
+                return 1
+            else:
+                self.logger.info(
+                    "Found exectuable property in current state. No property will be checked now according to the random checking policy.")
+
+    def mutate_the_main_path(self):
+        event = None
+        self.current_number_of_mutate_steps_on_single_node += 1
+
+        if self.current_number_of_mutate_steps_on_single_node >= self.max_number_of_mutate_steps_on_single_node:
+
+            if self.number_of_events_that_try_to_find_event_on_main_path <= self.max_number_of_events_that_try_to_find_event_on_main_path:
+                self.number_of_events_that_try_to_find_event_on_main_path += 1
+                if self.index_on_main_path_after_mutation == len(self.main_path_list):
+                    self.logger.info("reach the end of the main path")
+                    rules_to_check = self.kea.get_rules_that_pass_the_preconditions()
+                    if len(rules_to_check) > 0:
+                        t = self.time_recoder.get_time_duration()
+                        self.time_needed_to_satisfy_precondition.append(t)
+                        self.check_rule_with_precondition()
+                    return self.end_mutation()
+
+                event_str = self.get_event_from_main_path()
+                try:
+                    self.kea.exec_mainPath(event_str)
+                    self.logger.info("find the event in the main path")
+                    return None
+                except Exception:
+                    self.logger.info("can't find the event in the main path")
+                    return self.end_mutation()
+
+            return self.end_mutation()
+
+        self.index_on_main_path_after_mutation = -1
+
+        if self.check_property_with_probability() == 1:
+            # if the property has been checked, don't return any event
+            return None
+
+        event = self.generate_explore_event()
+        return event
+
+    def get_main_path_event(self):
+        """
+
+        """
+        if self.current_index_on_main_path == self.mutate_node_index_on_main_path:
+            self.logger.info(
+                "reach the mutate index, start mutate on the node %d" % self.mutate_node_index_on_main_path)
+            self.execute_main_path = False
+            return None
+
+        self.logger.info("execute node index on main path: %d" % self.current_index_on_main_path)
+        u2_event_str = self.main_path_list[self.current_index_on_main_path]
+        if u2_event_str is None:
+            self.logger.warning("event is None on main path node %d" % self.current_index_on_main_path)
+            self.current_index_on_main_path += 1
+            return self.get_main_path_event()
+        self.current_index_on_main_path += 1
+        return u2_event_str
+
+    def get_event_from_main_path(self):
+        """
+
+        """
+        if self.index_on_main_path_after_mutation == -1:
+            for i in range(len(self.main_path_list) - 1, -1, -1):
+
+                event_str = self.main_path_list[i]
+                if event_str is None:
+                    continue
+                self.index_on_main_path_after_mutation = i + 1
+                return event_str
+        else:
+            event_str = self.main_path_list[self.index_on_main_path_after_mutation]
+            if event_str is None:
+                return None
+
+            self.index_on_main_path_after_mutation += 1
+            return event_str
+        return None
+
+    def generate_explore_event(self):
+        """
+        generate an event based on current UTG to explore the app
+        @return: InputEvent
+        """
+        current_state = self.device.get_current_state()
+        self.logger.info("Current state: %s" % current_state.state_str)
+        if current_state.state_str in self.__missed_states:
+            self.__missed_states.remove(current_state.state_str)
+
+        if current_state.get_app_activity_depth(self.app) < 0:
+            # If the app is not in the activity stack
+            start_app_intent = self.app.get_start_intent()
+
+            # It seems the app stucks at some state, has been
+            # 1) force stopped (START, STOP)
+            #    just start the app again by increasing self.__num_restarts
+            # 2) started at least once and cannot be started (START)
+            #    pass to let viewclient deal with this case
+            # 3) nothing
+            #    a normal start. clear self.__num_restarts.
+
+            if self.__event_trace.endswith(
+                    EVENT_FLAG_START_APP + EVENT_FLAG_STOP_APP
+            ) or self.__event_trace.endswith(EVENT_FLAG_START_APP):
+                self.__num_restarts += 1
+                self.logger.info(
+                    "The app had been restarted %d times.", self.__num_restarts
+                )
+            else:
+                self.__num_restarts = 0
+
+            # pass (START) through
+            if not self.__event_trace.endswith(EVENT_FLAG_START_APP):
+                if self.__num_restarts > MAX_NUM_RESTARTS:
+                    # If the app had been restarted too many times, enter random mode
+                    msg = "The app had been restarted too many times. Entering random mode."
+                    self.logger.info(msg)
+                    self.__random_explore = True
+                else:
+                    # Start the app
+                    self.__event_trace += EVENT_FLAG_START_APP
+                    self.logger.info("Trying to start the app...")
+                    return IntentEvent(intent=start_app_intent)
+
+        elif current_state.get_app_activity_depth(self.app) > 0:
+            # If the app is in activity stack but is not in foreground
+            self.__num_steps_outside += 1
+
+            if self.__num_steps_outside > MAX_NUM_STEPS_OUTSIDE:
+                # If the app has not been in foreground for too long, try to go back
+                if self.__num_steps_outside > MAX_NUM_STEPS_OUTSIDE_KILL:
+                    stop_app_intent = self.app.get_stop_intent()
+                    go_back_event = IntentEvent(stop_app_intent)
+                else:
+                    go_back_event = KeyEvent(name="BACK")
+                self.__event_trace += EVENT_FLAG_NAVIGATE
+                self.logger.info("Going back to the app...")
+                return go_back_event
+        else:
+            # If the app is in foreground
+            self.__num_steps_outside = 0
+
+        # Get all possible input events
+        possible_events = current_state.get_possible_input()
+
+        if self.random_input:
+            random.shuffle(possible_events)
+        possible_events.append(KeyEvent(name="BACK"))
+        possible_events.append(RotateDevice())
+
+        self.__event_trace += EVENT_FLAG_EXPLORE
+
+        event = random.choice(possible_events)
+        if isinstance(event, RotateDevice):
+            if self.last_rotate_events == KEY_RotateDeviceNeutralEvent:
+                self.last_rotate_events = KEY_RotateDeviceRightEvent
+                event = RotateDeviceRightEvent()
+            else:
+                self.last_rotate_events = KEY_RotateDeviceNeutralEvent
+                event = RotateDeviceNeutralEvent()
+
+        return event
+
+    def check_the_app_on_foreground(self, current_state):
+        if current_state.get_app_activity_depth(self.app) < 0:
+            # If the app is not in the activity stack
+            start_app_intent = self.app.get_start_intent()
+
+            # It seems the app stucks at some state, has been
+            # 1) force stopped (START, STOP)
+            #    just start the app again by increasing self.__num_restarts
+            # 2) started at least once and cannot be started (START)
+            #    pass to let viewclient deal with this case
+            # 3) nothing
+            #    a normal start. clear self.__num_restarts.
+
+            if self.__event_trace.endswith(
+                    EVENT_FLAG_START_APP + EVENT_FLAG_STOP_APP
+            ) or self.__event_trace.endswith(EVENT_FLAG_START_APP):
+                self.__num_restarts += 1
+                self.logger.info(
+                    "The app had been restarted %d times.", self.__num_restarts
+                )
+            else:
+                self.__num_restarts = 0
+
+            # pass (START) through
+            if not self.__event_trace.endswith(EVENT_FLAG_START_APP):
+                if self.__num_restarts > MAX_NUM_RESTARTS:
+                    # If the app had been restarted too many times, enter random mode
+                    msg = "The app had been restarted too many times. Entering random mode."
+                    self.logger.info(msg)
+                    self.__random_explore = True
+                else:
+                    # Start the app
+                    self.__event_trace += EVENT_FLAG_START_APP
+                    self.logger.info("Trying to start the app...")
+                    return IntentEvent(intent=start_app_intent)
+
+        elif current_state.get_app_activity_depth(self.app) > 0:
+            # If the app is in activity stack but is not in foreground
+            self.__num_steps_outside += 1
+
+            if self.__num_steps_outside > MAX_NUM_STEPS_OUTSIDE:
+                # If the app has not been in foreground for too long, try to go back
+                if self.__num_steps_outside > MAX_NUM_STEPS_OUTSIDE_KILL:
+                    stop_app_intent = self.app.get_stop_intent()
+                    go_back_event = IntentEvent(stop_app_intent)
+                else:
+                    go_back_event = KeyEvent(name="BACK")
+                self.__event_trace += EVENT_FLAG_NAVIGATE
+                self.logger.info("Going back to the app...")
+                return go_back_event
+        else:
+            # If the app is in foreground
+            self.__num_steps_outside = 0

@@ -13,7 +13,10 @@ from .input_policy import (
     RandomPolicy,
     POLICY_NONE,
     POLICY_LLM,
-    LLMPolicy
+    LLMPolicy,
+    POLICY_LLM_Guided,
+    LLMGuidedPolicy
+
 )
 
 DEFAULT_POLICY = POLICY_RANDOM
@@ -92,6 +95,14 @@ class InputManager(object):
             input_policy = None
         elif self.policy_name == POLICY_GUIDED:
             input_policy = GuidedPolicy(
+                device,
+                app,
+                self.random_input,
+                self.kea,
+                self.generate_utg
+            )
+        elif self.policy_name == POLICY_LLM_Guided:
+            input_policy = LLMGuidedPolicy(
                 device,
                 app,
                 self.random_input,
