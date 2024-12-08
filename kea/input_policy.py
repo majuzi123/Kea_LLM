@@ -1094,11 +1094,6 @@ class LLMGuidedPolicy(KeaInputPolicy):
         )
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # if len(self.kea.all_mainPaths):
-        #     self.logger.info("Found %d mainPaths" % len(self.kea.all_mainPaths))
-        # else:
-        #     self.logger.error("No mainPath found")
-
         self.__num_restarts = 0
         self.__num_steps_outside = 0
         self.__event_trace = ""
@@ -1119,9 +1114,10 @@ class LLMGuidedPolicy(KeaInputPolicy):
 
         self.__action_history = []
         self.__all_action_history = set()
-        self.__activity_history = set()
+        self.__activity_history = []
         self.from_state = None
         self.rule_info_list = self.extract_rules_info()
+        self.max_exploration_count = 20
 
     def extract_rules_info(self):
         rule_info_list = []
@@ -1162,20 +1158,6 @@ class LLMGuidedPolicy(KeaInputPolicy):
             resource_ids = re.findall(resource_id_pattern, inside_precondition)
         return resource_ids[0]
 
-    # def select_main_path(self):
-    #     if len(self.kea.all_mainPaths) == 0:
-    #         self.logger.error("No mainPath")
-    #         return
-    #     self.main_path = random.choice(self.kea.all_mainPaths)
-    #     self.path_func, self.main_path = self.kea.parse_mainPath(self.main_path)
-    #     self.logger.info(f"Select the {len(self.main_path)} steps mainPath function: {self.path_func}")
-    #     self.main_path_list = copy.deepcopy(self.main_path)
-    #     self.max_number_of_events_that_try_to_find_event_on_main_path = min(10, len(self.main_path))
-    #     self.mutate_node_index_on_main_path = len(self.main_path)
-
-    # def set_target(self, target_resource_id, target_function_name):
-    #     self.target_resource_id = target_resource_id
-    #     self.target_function_name = target_function_name
 
     def generate_event(self):
         """
@@ -1190,67 +1172,80 @@ class LLMGuidedPolicy(KeaInputPolicy):
         if event is not None:
             return event
 
+        for index, rule_info in enumerate(self.rule_info_list):
+            if rule_info:
+                resource_id = rule_info['resource_ids']
+                if self.contains_resource_id(current_state, resource_id):
+                    self.execute_precondition_rules(index)
 
-        if self.all_preconditions_met_or_explored(100):
+        if self.all_preconditions_met_or_explored():
             # 所有前置条件都满足后，进行随机探索
-            event = self.mutate_the_main_path()
+            event = self.generate_explore_event()
         else:
             # 从rule_info_list中选择一个规则
-            rule_info = self.get_next_rule_info()
+            rule_info, rule_index = self.get_next_rule_info()
             if rule_info:
                 function_name = rule_info['function_name']
                 resource_ids = rule_info['resource_ids']
-
-                # 使用LLM来找到到达目标状态的路径
-                action, candidate_actions = self.query_llm_for_navigation(current_state, function_name, resource_ids)
+                if self.contains_resource_id(current_state, resource_ids):
+                    action = None
+                    self.execute_precondition_rules(rule_index)
+                else:
+                    action, candidate_actions = self.query_llm_for_navigation(current_state, function_name, resource_ids)
+                    rule_info['exploration_count'] += 1
                 if action is not None:
                     self.logger.info(f"LLM suggested event: {action}")
                     self.__action_history.append(current_state.get_action_desc(action))
                     self.__all_action_history.add(current_state.get_action_desc(action))
                     return action
-                # 如果LLM没有返回有效的事件，执行下一个前置条件规则
-                event = self.execute_next_precondition_rule(current_state, rule_info)
             else:
                 self.logger.info("No more rules to process.")
-                # 可以选择进行随机探索或结束测试
 
+        if event is None:
+            event = self.generate_explore_event()
         return event
 
+
+    def contains_resource_id(self, current_state, resource_ids):
+        """
+        Check if the given resource_id is present in the self.views.
+        """
+        for view_dict in current_state.views:
+            # 获取view的resource_id
+            current_resource_id = self.__safe_dict_get(view_dict, 'resource_id')
+            if current_resource_id == resource_ids:
+                return True
+        return False
+
+    def __safe_dict_get(self, dictionary, key, default=None):
+        """
+        A helper function to safely get a value from a dictionary.
+        """
+        return dictionary.get(key, default)
     def get_next_rule_info(self):
         # 从rule_info_list中选择一个未满足的规则
-        for rule_info in self.rule_info_list:
-            if not rule_info['met'] and rule_info['exploration_count'] < 100:
-                    return rule_info
-        return None
-        # # 如果LLM没有返回有效的事件，可能需要执行默认操作或生成一个探索事件
-        # self.logger.info("LLM did not provide a valid event, performing default action.")
-        #
-        # if (self.action_count == ACTION_COUNT_TO_START and self.current_index_on_main_path == 0) or isinstance(
-        #         self.last_event, ReInstallAppEvent):
-        #     self.select_main_path()
-        #     self.run_initial_rules()
-        #     time.sleep(2)
-        # if self.execute_main_path:
-        #     event_str = self.get_main_path_event()
-        #     if event_str:
-        #         self.logger.info("*****main path running*****")
-        #         self.kea.exec_mainPath(event_str)
-        #         return None
-        # if event is None:
-        #     event = self.mutate_the_main_path()
-        #
-        # return event
+        for index, rule_info in enumerate(self.rule_info_list):
+            if(rule_info['exploration_count'] >= self.max_exploration_count):
+                self.logger.info(f"Precondition {rule_info['resource_ids']} reached its max exploration_count {self.max_exploration_count} .")
+            if not rule_info['met'] and rule_info['exploration_count'] < self.max_exploration_count:
+                self.logger.info(f"Now let us explore the precondition {rule_info['resource_ids']}")
+                return rule_info, index
+        return None, -1
+
 
     def execute_next_precondition_rule(self, current_state):
         # 寻找并执行下一个前置条件对应的规则
         for rule_info in self.rule_info_list:
-            if not rule_info['met'] and rule_info['exploration_count'] < 100:
+            if not rule_info['met'] and rule_info['exploration_count'] < self.max_exploration_count:
                 # 导航至对应的页面并执行规则
                 if self.is_current_state_for_rule(current_state, rule_info['resource_ids']):
-                    event = self.execute_rule(rule_info['function_name'])
-                    if event:
+                    action, candidate_actions = self.query_llm_for_navigation(current_state, rule_info['function_name'], rule_info['resource_ids'])
+                    if action:
                         rule_info['exploration_count'] += 1
-                        return event
+                        self.logger.info(f"LLM suggested event: {action}")
+                        self.__action_history.append(current_state.get_action_desc(action))
+                        self.__all_action_history.add(current_state.get_action_desc(action))
+                        return action
         return None  # 如果没有找到对应的规则或页面，返回None
 
     def is_current_state_for_rule(self, current_state, resource_ids):
@@ -1260,10 +1255,10 @@ class LLMGuidedPolicy(KeaInputPolicy):
                 return True
         return False
 
-    def all_preconditions_met_or_explored(self, max_exploration_count):
+    def all_preconditions_met_or_explored(self):
         # 检查所有前置条件是否都已满足或达到探索次数上限
         for rule_info in self.rule_info_list:
-            if not rule_info['met'] and rule_info['exploration_count'] < max_exploration_count:
+            if not rule_info['met'] and rule_info['exploration_count'] < self.max_exploration_count:
                 return False
         return True
 
@@ -1278,7 +1273,7 @@ class LLMGuidedPolicy(KeaInputPolicy):
         # Use LLM to determine the next action to take in order to reach the target state
         task_prompt = (
             "You are an expert in App GUI testing. "
-            "Your task is to guide the testing tool to reach the page with resourceId '{}' "
+            "Your immediate task is to guide the testing tool to quickly locate and navigate to the page with resourceId '{}' "
             "where the function '{}' needs to be tested. "
             "Based on the current GUI information, please suggest the next action to take."
         ).format(resource_id, function_name)
@@ -1287,8 +1282,9 @@ class LLMGuidedPolicy(KeaInputPolicy):
             self.__activity_history)
         history_prompt = f'I have already completed the following steps to navigate: \n ' + ';\n '.join(
             self.__action_history)
-        state_prompt, candidate_actions = current_state.get_described_actions()
-        question = 'Which action should I choose next? Just return the action id and nothing else.\nIf no more action is needed, return -1.'
+        state_prompt, candidate_actions = current_state.get_described_actions_llm()
+        question = (f'Which action should I choose next? Just return the action id and nothing else. Do not select an action id outside of the provided range 0-{len(candidate_actions)-1}.\nIf no more action is needed, return -1. However, you cannot choose -1 consecutively.\nIf you have clicked the same resourceId multiple times, it means you have been looping in the same page for too long, '
+                    'and you should consider choosing other provided action, do not allways choose the same action id.')
 
         # 将所有部分组合成完整的提示词
         full_prompt = f'{task_prompt}\n{visited_page_prompt}\n{history_prompt}\n{state_prompt}\n{question}'
@@ -1300,6 +1296,7 @@ class LLMGuidedPolicy(KeaInputPolicy):
             return None, candidate_actions
         idx = int(match.group(0))
         selected_action = candidate_actions[idx]
+        self.__activity_history.append(current_state.activity_short_name)
         if isinstance(selected_action, SetTextEvent):
             view_text = current_state.get_view_desc(selected_action.view)
             question = f'What text should I enter to the {view_text}? Just return the text and nothing else.'
@@ -1311,16 +1308,31 @@ class LLMGuidedPolicy(KeaInputPolicy):
             if len(selected_action.text) > 30:  # heuristically disable long text input
                 selected_action.text = ''
         return selected_action, candidate_actions
-        # action_id = self.parse_action_id(response)
-        # if action_id == -1:
-        #     return None  # No more actions needed
-        # return self.get_action_by_id(current_state, action_id)
+
+    def execute_precondition_rules(self, rule_index):
+        """
+        Execute the rules corresponding to the preconditions once the precondition page is reached.
+        """
+        self.logger.info("Precondition page reached. Executing precondition rules.")
+        # 获取满足前置条件的规则
+        rules_to_check = self.kea.get_rules_that_pass_the_preconditions()
+        if len(rules_to_check) > 0:
+            t = self.time_recoder.get_time_duration()
+            self.time_needed_to_satisfy_precondition.append(t)
+            self.check_rule_with_precondition()
+            self.rule_info_list[rule_index]['met'] = True
+            self.logger.info(f"Precondition {self.rule_info_list[rule_index]['resource_ids']} reached.")
+        else:
+            self.logger.info("No rules to check for the current preconditions.")
+        event = self.generate_explore_event()
+        return event
+
 
     def _query_llm(self, prompt):
         # TODO: replace with your own LLM
         from openai import OpenAI
         client = OpenAI(
-            api_key="sk-wAdbDvY3957qtwtGv0gas9yv6yCTLo8jMBkhyIg4bVIlPjxt",
+            api_key="",
             base_url="https://api.moonshot.cn/v1",
         )
         response = self.send_request_with_retry(
@@ -1336,7 +1348,7 @@ class LLMGuidedPolicy(KeaInputPolicy):
         )
         return response
 
-    def send_request_with_retry(self, client, model, messages, temperature, max_retries=3, delay=60):
+    def send_request_with_retry(self, client, model, messages, temperature, max_retries=200, delay=60):
         retries = 0
         while retries < max_retries:
             try:
@@ -1355,37 +1367,11 @@ class LLMGuidedPolicy(KeaInputPolicy):
                     print("Max retries reached. Aborting...")
                     raise
 
-    # def _query_llm(self, prompt, model_name="moonshot-v1-8k"):
-    #     # TODO: replace with your own LLM
-    #     from openai import OpenAI
-    #     client = OpenAI(
-    #         api_key="",
-    #         base_url="https://api.moonshot.cn/v1",
-    #     )
-    #     messages = [{"role": "user", "content": prompt}]
-    #     completion = client.chat.completions.create(messages=messages, model=model_name, temperature=0.3)
-    #     return completion.choices[0].message.content
 
     def parse_action_id(self, response):
         match = re.search(r'\d+', response)
         return int(match.group(0)) if match else None
 
-    # def get_action_by_id(self, current_state, action_id):
-    #     candidate_actions = current_state.get_candidate_actions()
-    #     return candidate_actions[action_id] if 0 <= action_id < len(candidate_actions) else None
-
-    def end_mutation(self):
-        self.index_on_main_path_after_mutation = -1
-        self.number_of_events_that_try_to_find_event_on_main_path = 0
-        self.execute_main_path = True
-        self.current_number_of_mutate_steps_on_single_node = 0
-        self.current_index_on_main_path = 0
-        self.mutate_node_index_on_main_path -= 1
-        if self.mutate_node_index_on_main_path == -1:
-            self.mutate_node_index_on_main_path = len(self.main_path)
-            return ReInstallAppEvent(app=self.app)
-        self.logger.info("reach the max number of mutate steps on single node, restart the app")
-        return KillAndRestartAppEvent(app=self.app)
 
     def check_property_with_probability(self, p=0.5):
         """
@@ -1408,82 +1394,8 @@ class LLMGuidedPolicy(KeaInputPolicy):
                 self.logger.info(
                     "Found exectuable property in current state. No property will be checked now according to the random checking policy.")
 
-    def mutate_the_main_path(self):
-        event = None
-        self.current_number_of_mutate_steps_on_single_node += 1
 
-        if self.current_number_of_mutate_steps_on_single_node >= self.max_number_of_mutate_steps_on_single_node:
 
-            if self.number_of_events_that_try_to_find_event_on_main_path <= self.max_number_of_events_that_try_to_find_event_on_main_path:
-                self.number_of_events_that_try_to_find_event_on_main_path += 1
-                if self.index_on_main_path_after_mutation == len(self.main_path_list):
-                    self.logger.info("reach the end of the main path")
-                    rules_to_check = self.kea.get_rules_that_pass_the_preconditions()
-                    if len(rules_to_check) > 0:
-                        t = self.time_recoder.get_time_duration()
-                        self.time_needed_to_satisfy_precondition.append(t)
-                        self.check_rule_with_precondition()
-                    return self.end_mutation()
-
-                event_str = self.get_event_from_main_path()
-                try:
-                    self.kea.exec_mainPath(event_str)
-                    self.logger.info("find the event in the main path")
-                    return None
-                except Exception:
-                    self.logger.info("can't find the event in the main path")
-                    return self.end_mutation()
-
-            return self.end_mutation()
-
-        self.index_on_main_path_after_mutation = -1
-
-        if self.check_property_with_probability() == 1:
-            # if the property has been checked, don't return any event
-            return None
-
-        event = self.generate_explore_event()
-        return event
-
-    def get_main_path_event(self):
-        """
-
-        """
-        if self.current_index_on_main_path == self.mutate_node_index_on_main_path:
-            self.logger.info(
-                "reach the mutate index, start mutate on the node %d" % self.mutate_node_index_on_main_path)
-            self.execute_main_path = False
-            return None
-
-        self.logger.info("execute node index on main path: %d" % self.current_index_on_main_path)
-        u2_event_str = self.main_path_list[self.current_index_on_main_path]
-        if u2_event_str is None:
-            self.logger.warning("event is None on main path node %d" % self.current_index_on_main_path)
-            self.current_index_on_main_path += 1
-            return self.get_main_path_event()
-        self.current_index_on_main_path += 1
-        return u2_event_str
-
-    def get_event_from_main_path(self):
-        """
-
-        """
-        if self.index_on_main_path_after_mutation == -1:
-            for i in range(len(self.main_path_list) - 1, -1, -1):
-
-                event_str = self.main_path_list[i]
-                if event_str is None:
-                    continue
-                self.index_on_main_path_after_mutation = i + 1
-                return event_str
-        else:
-            event_str = self.main_path_list[self.index_on_main_path_after_mutation]
-            if event_str is None:
-                return None
-
-            self.index_on_main_path_after_mutation += 1
-            return event_str
-        return None
 
     def generate_explore_event(self):
         """
